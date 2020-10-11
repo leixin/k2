@@ -2,56 +2,53 @@
 
 // Copyright (c)  2020  Xiaomi Corporation (authors: Daniel Povey
 //                                                   Haowen Qiu)
+//                      Mobvoi Inc.        (authors: Fangjun Kuang)
 
 // See ../../LICENSE for // clarification regarding multiple authors
+
+#include <string>
 
 #include "k2/csrc/array_ops.h"
 #include "k2/csrc/fsa.h"
 
-namespace {
-/* Will be used in FsaVecFromTensor to call ExclusiveSum (which calls
-   cub::DeviceScan::ExclusiveSum internally).
-
-   This is a kind of pseudo-vector (that we don't have to allocate
-   memory for) It behaves like a pointer to a vector of size
-   `num_arcs`, of 'tails' (see `tails concept` in utils.h) which
-   tells us if this is the last arc within this FSA.
- */
-struct IsTail {
-  const k2::Arc *arcs;
-  const int32_t *num_arcs;
-
-  explicit IsTail(const k2::Arc *arcs, const int32_t *num_arcs)
-      : arcs(arcs), num_arcs(num_arcs) {}
-  __host__ __device__ IsTail(const IsTail &other)
-      : arcs(other.arcs), num_arcs(num_arcs){};
-
-  // operator[] and operator+ are required by cub::DeviceScan::ExclusiveSum
-  __host__ __device__ bool operator[](int32_t i) const {
-    return (i + 1 >= *num_arcs || arcs[i + 1].src_state < arcs[i].src_state);
-  }
-  __host__ __device__ IsTail operator+(int32_t n) const {
-    IsTail tmp(*this);
-    tmp.arcs += n;
-    return tmp;
-  }
-};
-}  // namespace
-
-namespace std {
-// vaule_type is required by cub::DeviceScan::ExclusiveSum
-template <>
-struct iterator_traits<::IsTail> {
-  typedef bool value_type;
-};
-}  // namespace std
 
 namespace k2 {
 
-int32_t GetFsaVecBasicProperties(FsaVec &fsa_vec) {
+// for debug only
+std::ostream &operator<<(std::ostream &os, const Arc &arc) {
+  static constexpr char kSep = ' ';
+  os << arc.src_state << kSep << arc.dest_state << kSep << arc.symbol << kSep
+     << arc.score;
+  return os;
+}
+
+std::string FsaPropertiesAsString(int32_t properties) {
+  static constexpr char kSep = '|';
+  std::ostringstream os;
+
+  // clang-format off
+  if (properties & kFsaPropertiesValid) os << kSep << "Valid";
+  if (properties & kFsaPropertiesNonempty) os << kSep << "Nonempty";
+  if (properties & kFsaPropertiesTopSorted) os << kSep << "TopSorted";
+  if (properties & kFsaPropertiesTopSortedAndAcyclic) os << kSep << "TopSortedAndAcyclic"; // NOLINT
+  if (properties & kFsaPropertiesArcSorted) os << kSep << "ArcSorted";
+  if (properties & kFsaPropertiesArcSortedAndDeterministic) os << kSep << "ArcSortedAndDeterministic";  // NOLINT
+  if (properties & kFsaPropertiesEpsilonFree) os << kSep << "EpsilonFree";
+  if (properties & kFsaPropertiesMaybeAccessible) os << kSep << "MaybeAccessible";  // NOLINT
+  if (properties & kFsaPropertiesMaybeCoaccessible) os << kSep << "MaybeCoaccessible";  // NOLINT
+  if (properties & kFsaPropertiesSerializable) os << kSep << "Serializable";
+  // clang-format on
+
+  size_t offset = (os.str().empty() ? 0 : 1);  // remove leading '|'
+  os << '"';
+  return std::string("\"") + std::string(os.str().c_str() + offset);
+}
+
+void GetFsaVecBasicProperties(FsaVec &fsa_vec, Array1<int32_t> *properties_out,
+                              int32_t *tot_properties_out) {
   if (fsa_vec.NumAxes() != 3) {
-    K2_LOG(FATAL) << "FsaVec has wrong number of axes: " << fsa_vec.NumAxes()
-                  << ", expected 3.";
+    K2_LOG(FATAL) << "Input has wrong num-axes " << fsa_vec.NumAxes()
+                  << " vs. 3.";
   }
   ContextPtr c = fsa_vec.Context();
   const int32_t *row_ids1_data = fsa_vec.shape.RowIds(1).Data(),
@@ -62,32 +59,35 @@ int32_t GetFsaVecBasicProperties(FsaVec &fsa_vec) {
 
   int32_t num_arcs = fsa_vec.values.Dim();
 
-  // `neg_` means negated. It's more convenient to do it this way.
-  Array1<int32_t> neg_properties(c, num_arcs);
+  // properties per arc; these will be and-ed over all arcs.
+  Array1<int32_t> properties(c, num_arcs);
   int32_t num_states = fsa_vec.shape.RowIds(1).Dim(),
           num_fsas = fsa_vec.shape.Dim0();
 
   // `reachable[idx01]` will be true if the state with index idx01 has an arc
   // entering it or is state 0 of its FSA, not counting self-loops; it's a
-  // looser condition than being 'accessible' in FSA terminlogy, simply meaning
+  // looser condition than being 'accessible' in FSA terminology, simply meaning
   // it's reachable from some state (which might not itself be reachable).
   //
   // reachable[num_states + idx01] will be true if the state with index idx01 is
   // the final-state of its FSA (i.e. last-numbered) or has at least one arc
   // leaving it, not counting self-loops. Again, it's a looser condition than
   // being 'co-accessible' in FSA terminology.
-  Array1<char> reachable(c, num_states * 2 + 1, static_cast<char>(0));
-  Array1<char> flag = reachable.Range(num_states * 1, 1);
-  Array1<char> co_reachable = reachable.Range(num_states, num_states);
-  reachable = reachable.Range(0, num_states);
-  int32_t *neg_properties_data = neg_properties.Data();
+
+  Array1<char> reachable_mem(c, num_states * 2 + num_fsas * 2,
+                             static_cast<char>(0));
+
+  Array1<char> reachable = reachable_mem.Range(0, num_states);
+  Array1<char> co_reachable = reachable_mem.Range(num_states, num_states);
+
+  int32_t *properties_data = properties.Data();
   char *reachable_data = reachable.Data();  // access co_reachable via this.
 
   auto lambda_get_properties = [=] __host__ __device__(int32_t idx012) -> void {
     Arc arc = arcs_data[idx012];
     Arc prev_arc;
     if (idx012 > 0) prev_arc = arcs_data[idx012 - 1];
-    int32_t idx01 = row_ids2_data[idx012], idx01x = row_splits2_data[idx012],
+    int32_t idx01 = row_ids2_data[idx012], idx01x = row_splits2_data[idx01],
             idx2 = idx012 - idx01x, idx0 = row_ids1_data[idx01],
             idx0x = row_splits1_data[idx0],
             idx0x_next = row_splits1_data[idx0 + 1], idx1 = idx01 - idx0x,
@@ -96,6 +96,8 @@ int32_t GetFsaVecBasicProperties(FsaVec &fsa_vec) {
 
     int32_t neg_property = 0;
     if (arc.src_state != idx1) neg_property |= kFsaPropertiesValid;
+    if (arc.dest_state < 0 || arc.dest_state >= this_fsa_num_states)
+      neg_property |= kFsaPropertiesValid;
     if (arc.dest_state <= arc.src_state) {
       neg_property |= kFsaPropertiesTopSortedAndAcyclic;
       if (arc.dest_state < arc.src_state)
@@ -129,80 +131,201 @@ int32_t GetFsaVecBasicProperties(FsaVec &fsa_vec) {
     }
 
     if (idx2 == 0) {
-      // First arc leaving this state record that this state has arcs leaving
+      // First arc leaving this state records that this state has arcs leaving
       // it.
       if (arc.dest_state != arc.src_state)
         reachable_data[num_states + idx01] = 1;
+    } else {
+      int32_t symbol_diff = arc.symbol - prev_arc.symbol;
+      if (symbol_diff <= 0)
+        neg_property |= kFsaPropertiesArcSortedAndDeterministic;
+      if (symbol_diff < 0) neg_property |= kFsaPropertiesArcSorted;
     }
-    neg_properties_data[idx012] = ~neg_property;
+
+    properties_data[idx012] = ~neg_property;
   };
   Eval(c, num_arcs, lambda_get_properties);
-  // Note: eventually, for more diagnostics, we could use AndPerSublist to get
-  // the properties one by  one.
 
-  Array1<int32_t> and_properties = neg_properties.Range(0, 1);  // ok to overlap
-  Array1<char> and_reachable = reachable.Range(0, 1);
-  Array1<char> and_co_reachable = reachable.Range(0, 1);
-  ParallelRunner pr(c);
+  // Figure out the properties per FSA.
+  RaggedShape fsa_to_arcs_shape = RemoveAxis(fsa_vec.shape, 1),
+              fsa_to_states_shape = RemoveAxis(fsa_vec.shape, 2);
+  Ragged<int32_t> properties_ragged(fsa_to_arcs_shape, properties);
+  Ragged<char> reachable_ragged(fsa_to_states_shape, reachable),
+      co_reachable_ragged(fsa_to_states_shape, co_reachable);
+
+  Array1<int32_t> properties_per_fsa_mem(c, num_fsas + 1),
+      properties_per_fsa = properties_per_fsa_mem.Range(0, num_fsas),
+      properties_total = properties_per_fsa_mem.Range(num_fsas, 1);
+
+  Array1<char> reachable_per_fsa =
+                   reachable_mem.Range(num_states * 2, num_fsas),
+               co_reachable_per_fsa =
+                   reachable_mem.Range(num_states * 2 + num_fsas, num_fsas);
   {
-    With(pr.NewStream());
-    And(neg_properties, static_cast<int32_t>(kFsaAllProperties),
-        &and_properties);
+    ParallelRunner pr(c);
+    {
+      With(pr.NewStream());
+      AndPerSublist(properties_ragged, static_cast<int32_t>(kFsaAllProperties),
+                    &properties_per_fsa);
+    }
+    {
+      With(pr.NewStream());
+      AndPerSublist(reachable_ragged, static_cast<char>(1), &reachable_per_fsa);
+    }
+    {
+      With(pr.NewStream());
+      AndPerSublist(co_reachable_ragged, static_cast<char>(1),
+                    &co_reachable_per_fsa);
+    }
   }
+
   {
-    With(pr.NewStream());
-    And(reachable, static_cast<char>(1), &and_reachable);
-  }
-  {
-    With(pr.NewStream());
-    And(co_reachable, static_cast<char>(1), &and_co_reachable);
-  }
-  {
-    char *flag_data = flag.Data();
-    auto lambda_find_empty_fsas = [=] __host__ __device__(int32_t i) -> void {
-      if (row_ids1_data[i + 1] == row_ids1_data[i])
-        *flag_data = 1;  // There is an empty FSA.
+    int32_t *properties_per_fsa_data = properties_per_fsa.Data();
+    char *reachable_per_fsa_data = reachable_per_fsa.Data(),
+         *co_reachable_per_fsa_data = co_reachable_per_fsa.Data();
+
+    auto lambda_finalize_properties =
+        [=] __host__ __device__(int32_t i) -> void {
+      int32_t neg_properties = ~(properties_per_fsa_data[i]);
+      char reachable = reachable_per_fsa_data[i],
+           co_reachable = co_reachable_per_fsa_data[i];
+      int32_t fsa_has_no_arcs = (row_splits2_data[row_splits1_data[i]] ==
+                                 row_splits2_data[row_splits1_data[i + 1]]);
+      neg_properties |= (!reachable * kFsaPropertiesMaybeAccessible) |
+                        (!co_reachable * kFsaPropertiesMaybeCoaccessible) |
+                        (fsa_has_no_arcs * kFsaPropertiesSerializable);
+      properties_per_fsa_data[i] = ~neg_properties;
     };
-    Eval(pr.NewStream(), num_fsas, lambda_find_empty_fsas);
+    Eval(c, num_fsas, lambda_finalize_properties);
+
+    And(properties_per_fsa, static_cast<int32_t>(kFsaAllProperties),
+        &properties_total);
+    *tot_properties_out = properties_total[0];
+    *properties_out = properties_per_fsa;
   }
-
-  int32_t properties =
-      and_properties[0] |
-      (and_reachable[0] ? kFsaPropertiesMaybeAccessible : 0) |
-      (and_co_reachable[0] ? kFsaPropertiesMaybeCoaccessible : 0);
-  if (flag[0])  // not serializable because has empty FSA.
-    properties &= ~kFsaPropertiesSerializable;
-
-  // probably tons of bugs in this :-(
-  return properties;
 }
 
-Fsa FsaFromTensor(Tensor &t, bool *error) {
+FsaVec FsaVecFromFsa(const Fsa &fsa) {
+  ContextPtr c = fsa.values.Context();
+  K2_CHECK_EQ(fsa.NumAxes(), 2);
+  RaggedShape first_axis = TrivialShape(c, fsa.shape.Dim0());
+  RaggedShape fsa_vec_shape = ComposeRaggedShapes(first_axis, fsa.shape);
+  return Ragged<Arc>(fsa_vec_shape, fsa.values);
+}
+
+int32_t GetFsaBasicProperties(const Fsa &fsa) {
+  if (fsa.NumAxes() != 2) return 0;
+  FsaVec vec = FsaVecFromFsa(fsa);
+  Array1<int32_t> properties;
+  int32_t ans;
+  GetFsaVecBasicProperties(vec, &properties, &ans);
+  return ans;
+}
+
+
+Fsa FsaFromArray1(Array1<Arc> &array, bool *error) {
+  const Arc *arcs_data = array.Data();
+  ContextPtr &c = array.Context();
+  int32_t num_arcs = array.Dim();
   *error = false;
-  if (t.GetDtype() != kInt32Dtype) {
-    K2_LOG(WARNING) << "Could not convert tensor to FSA, wrong dtype, got "
-                    << TraitsOf(t.GetDtype()).Name() << " but expected "
-                    << TraitsOf(kInt32Dtype).Name();
-    *error = true;
-    return Fsa();  // Invalid, empty FSA
-  }
-  Ragged<Arc> ans = FsaVecFromTensor(t, error);
-  if (!*error) {
-    if (ans.NumAxes() != 3 || ans.shape.Dim0() != 1) {
-      K2_LOG(WARNING) << "Input does not seem to be a valid, single FSA";
-      return Fsa();  // empty ragged tensor
-    } else {
-      // remove leading axis. this is more efficient than doing
-      // return ans.Index(0, 0);
-      // and should give the same answer
-      RaggedShape shape = RemoveAxis(ans.shape, 0);
-      return Ragged<Arc>(shape, ans.values);
+
+  // If the FSA has arcs entering the final state, that will
+  // tell us what the final-state id is.
+  // If there are no arcs entering the final-state, we let the final state be
+  // (highest numbered state that has arcs leaving it) + 1, so num_states
+  // (highest numbered state that has arcs leaving it) + 2.
+
+  // element 0 is num-states, element 1 is error flag that's set to
+  // 0 on error.
+
+  Array1<int32_t> num_states_array(c, 2, -1);
+  int32_t *num_states_data = num_states_array.Data();
+
+  Array1<int32_t> row_ids1(c, num_arcs);  // maps arc->state.
+  int32_t *row_ids1_data = row_ids1.Data();
+
+
+  auto lambda_misc = [=] __host__ __device__(int32_t i) -> void {
+    row_ids1_data[i] = arcs_data[i].src_state;
+    if (arcs_data[i].symbol == -1) {
+      int32_t final_state = arcs_data[i].dest_state;
+      int32_t old_value = num_states_data[0];
+      if (old_value >= 0 && old_value != final_state + 1)
+        num_states_data[1] = 0;  // set error flag.
+      num_states_data[0] = final_state + 1;
     }
+  };
+  Eval(c, num_arcs, lambda_misc);
+  num_states_array = num_states_array.To(GetCpuContext());
+  int32_t num_states = num_states_array[0],
+    error_flag = num_states_array[1];
+  if (error_flag == 0) {
+    K2_LOG(WARNING) << "Could not convert tensor to FSA, there was a problem "
+                       "working out the num-states in the FSA, num_states="
+                    << num_states;
+    *error = true;
+    return Fsa();
+  }
+  if (num_states == -1) {
+    // there was no final arc, so let the final state be the highest-numbered
+    // state that is referenced, plus one.
+    
+    Array1<int32_t> max_state(c, num_arcs);
+    int32_t *max_state_data = max_state.Data();
+    auto lambda_get_dest_state = [=] __host__ __device__(int32_t i) -> void {
+      int32_t dest = arcs_data[i].dest_state,
+        src = arcs_data[i].src_state;
+      max_state_data[i] = (dest > src ? dest : src);
+    };
+    Eval(c, num_arcs, lambda_get_dest_state);
+    Array1<int32_t> max_state0 = max_state.Range(0, 1);    
+    Max(max_state, 0, &max_state0);
+    num_states = max_state[0] + 2;
+  }
+
+  if (!ValidateRowIds(row_ids1)) {
+    K2_LOG(WARNING) << "Could not convert tensor to FSA, "
+                       "src_states of arcs were out of order";
+    *error = true;
+    return Fsa();
+  }
+  Array1<int32_t> row_splits1(c, num_states + 1);
+  RowIdsToRowSplits(c, num_arcs, row_ids1_data, false, num_states,
+                    row_splits1.Data());
+#ifndef NDEBUG
+  if (!ValidateRowSplitsAndIds(row_splits1, row_ids1, nullptr)) {
+    K2_LOG(FATAL) << "Failure validating row-splits/row-ids, likely code error";
+  }
+#endif
+
+  RaggedShape fsas_shape =
+      RaggedShape2(&row_splits1, &row_ids1, row_ids1.Dim());
+  Fsa ans = Ragged<Arc>(fsas_shape, array);
+  int32_t tot_properties = GetFsaBasicProperties(ans);
+  // TODO: check properties, at least
+  int32_t required_props = (kFsaPropertiesValid | kFsaPropertiesNonempty |
+                            kFsaPropertiesSerializable);
+  if (tot_properties & required_props != required_props) {
+    K2_LOG(WARNING) << "Did not have expected properties "
+                    << FsaPropertiesAsString(tot_properties & required_props)
+                    << " vs. " << FsaPropertiesAsString(required_props)
+                    << ", all properties were: "
+                    << FsaPropertiesAsString(tot_properties);
+    *error = true;
   }
   return ans;
 }
 
-FsaVec FsaVecFromTensor(Tensor &t, bool *error) {
+
+Tensor FsaToTensor(const Fsa &fsa) {
+  K2_CHECK_EQ(fsa.NumAxes(), 2);
+  Array2<int32_t> arcs_as_ints(fsa.values.Dim(), 4, 4,
+                               fsa.values.ByteOffset(),
+                               fsa.values.GetRegion());
+  return arcs_as_ints.ToTensor();
+}
+  
+Fsa FsaFromTensor(Tensor &t, bool *error) {
   if (!t.IsContiguous()) t = ToContiguous(t);
 
   *error = false;
@@ -219,109 +342,131 @@ FsaVec FsaVecFromTensor(Tensor &t, bool *error) {
   }
   K2_CHECK_EQ(sizeof(Arc), sizeof(int32_t) * 4);
   int32_t *tensor_data = t.Data<int32_t>();
-  const Arc *arcs = reinterpret_cast<const Arc *>(tensor_data);
-  ContextPtr c = t.Context();
-  const int32_t num_arcs = t.Dim(0);
-  Array1<int32_t> fsa_ids(c, num_arcs + 1);
-  // `fsa_ids` will be the exclusive sum of `tails`.  We will remove the last
-  // element after we get its value.  Note: `fsa_ids` could be viewed as
-  // `row_ids1`.
-  Array1<int32_t> num_arcs_array(c, 1, num_arcs);
-  const int32_t *num_arcs_data = num_arcs_array.Data();
-  IsTail tails(arcs, num_arcs_data);
-  ExclusiveSum(c, num_arcs + 1, tails, fsa_ids.Data());
 
-  int32_t num_fsas = fsa_ids[num_arcs];
-  fsa_ids = fsa_ids.Range(0, num_arcs);
-  int32_t *fsa_ids_data = fsa_ids.Data();
+  Array1<Arc> arc_array(t.Dim(0), t.GetRegion(), t.ByteOffset());
+  return FsaFromArray1(arc_array, error);
+}
 
-  // Get the num-states per FSA, including the final-state which must be
-  // numbered last.  If the FSA has arcs entering the final state, that will
-  // tell us what the final-state id is.
-  //   num_state_per_fsa has 2 parts, for 2 different methods of finding the
-  //   right FSA (we'll later shorten it after disambiguating).
-  // The very last element has an error flag that we'll set to 0 if there is
-  // an error.
-  Array1<int32_t> num_states_per_fsa(c, 2 * num_fsas + 1, -1);
-  int32_t *num_states_per_fsa_data = num_states_per_fsa.Data();
-  auto lambda_get_num_states_a = [=] __host__ __device__(int32_t i) -> void {
-    if (arcs[i].symbol == -1) {
-      int32_t final_state = arcs[i].dest_state, fsa_id = fsa_ids_data[i];
-      num_states_per_fsa_data[fsa_id] = final_state + 1;
-    } else if (i + 1 == num_arcs || arcs[i].src_state < arcs[i + 1].src_state) {
-      // This is the last arc in this FSA.
-      // The final state cannot have arcs leaving it, so the smallest
-      // possible num-states (counting the final-state as a state) is
-      // (last state that has an arc leaving it) + 2.
-      int32_t final_state = arcs[i].src_state + 1, fsa_id = fsa_ids_data[i];
-      num_states_per_fsa_data[fsa_id] = final_state + 1;
-    }
-  };
-  Eval(c, num_arcs, lambda_get_num_states_a);
-  auto lambda_get_num_states_b = [=] __host__ __device__(int32_t i) -> void {
-    int32_t num_states_1 = num_states_per_fsa_data[i],
-            num_states_2 = num_states_per_fsa_data[i + num_fsas];
-    if (num_states_2 < 0 || (num_states_1 < 0 && num_states_2 > num_states_1)) {
-      // Note: num_states_2 is a lower bound on the final-state, something is
-      // wrong if num_states_1 != -1 and num_states_2  is greater than
-      // num_states_1.
-      num_states_per_fsa_data[2 * num_fsas] = 0;  // Error
-    }
-    int32_t num_states = (num_states_1 < 0 ? num_states_2 : num_states_1);
-    num_states_per_fsa_data[i] = num_states;
-  };
-  Eval(c, num_arcs, lambda_get_num_states_b);
-  if (num_states_per_fsa[2 * num_fsas] == 0) {
-    K2_LOG(WARNING)
-        << "Could not convert tensor to FSA, there was a problem "
-           "working out the num-states in the FSAs, num_states_per_fsa="
-        << num_states_per_fsa;
+
+FsaVec FsaVecFromTensor(Tensor &t, bool *error) {
+  if (!t.IsContiguous()) t = ToContiguous(t);
+
+  *error = false;
+  if (t.GetDtype() != kInt32Dtype) {
+    K2_LOG(WARNING) << "Could not convert tensor to FSA, wrong dtype, got "
+                    << TraitsOf(t.GetDtype()).Name() << " but expected "
+                    << TraitsOf(kInt32Dtype).Name();
+    *error = true;
+    return Fsa();  // Invalid, empty FSA
+  }  
+  int32_t num_fsas;
+  if (t.NumAxes() != 1) { 
+    K2_LOG(WARNING) << "Could not convert tensor to FSA, shape was "
+                    << t.Dims();
+    *error = true;
+    return Fsa();
   }
-  num_states_per_fsa = num_states_per_fsa.Range(0, num_fsas + 1);
-  // fsa_state_offsets is of size num_fsas + 1.
-  // Note: fsa_state_offsets could be called row_splits1.
-  Array1<int32_t> fsa_state_offsets = ExclusiveSum(num_states_per_fsa);
-  int32_t tot_num_states = fsa_state_offsets[num_fsas];
+  int32_t num_ints = t.Dim(0);
+  Array1<int32_t> int_array(num_ints, t.GetRegion(), t.ByteOffset());
+  num_fsas = int_array[0];
 
-  const int32_t *fsa_state_offsets_data = fsa_state_offsets.Data();
+  int32_t arcs_start = 2 + (num_fsas + 1) * 2;
+  if (num_fsas < 0 || num_ints < arcs_start || (num_ints - arcs_start) % 4 != 0) {
+    K2_LOG(WARNING) << "Could not convert tensor to FSA, num_ints = "
+                    << num_ints << ", num_fsas = " << num_fsas;
+    *error = true;
+    return Fsa();
+  }    
 
-  // by `row_ids2` we mean row_ids for axis=2. This is the second
-  // of two row_ids vectors. It maps from idx012 to idx01.
-  Array1<int32_t> row_ids2(c, num_arcs);
-  int32_t *row_ids2_data = row_ids2.Data();
-  auto lambda_set_row_ids2 = [=] __host__ __device__(int32_t i) -> void {
-    int32_t src_state = arcs[i].src_state, fsa_id = fsa_ids_data[i];
-    row_ids2_data[i] = fsa_state_offsets_data[fsa_id] + src_state;
+  Array1<int32_t> row_splits1 = int_array.Range(2, num_fsas + 1),
+    row_splits12 = int_array.Range(2 + num_fsas + 1, num_fsas + 1),
+    arcs_ints = int_array.Range(arcs_start, num_ints - arcs_start);
+  int32_t num_arcs = (num_ints - arcs_start) / 4;
+
+  Array1<Arc> arcs(num_arcs, arcs_ints.GetRegion(),
+                   arcs_ints.ByteOffset());
+
+  if (num_arcs != row_splits12[num_fsas]) {
+    K2_LOG(WARNING) << "Could not convert tensor to FSA, num_arcs = "
+                    << num_arcs << " vs. " << row_splits12[num_fsas];
+  }
+  if (!ValidateRowSplits(row_splits1) || !ValidateRowSplits(row_splits12)) {
+    K2_LOG(WARNING) << "Could not convert tensor to FSA, "
+                       "row_splits were out of order";
+    *error = true;
+    return Fsa();
+  }
+  ContextPtr c = int_array.Context();
+  
+  // TODO: would be nice to transfer this and row_splits12[num_fsas] at the same
+  // time.
+  int32_t num_states = row_splits1[num_fsas];
+  Array1<int32_t> row_ids1(c, num_states),
+    row_ids12(c, num_arcs),  // we'll modify row_ids12 to be row_ids2.
+    row_splits2(c, num_states + 1);
+  RowSplitsToRowIds(row_splits1, row_ids1);
+  RowSplitsToRowIds(row_splits12, row_ids12);
+
+  const int32_t *row_ids1_data = row_ids1.Data(),
+    *row_splits12_data = row_splits12.Data(),
+    *row_splits1_data = row_splits1.Data();
+  int32_t *row_ids12_data = row_ids12.Data();
+  Arc *arcs_data = arcs.Data();
+  
+  auto lambda_make_row_ids2 = [=] __host__ __device__ (int32_t arc_idx012) -> void {
+    int32_t fsa_idx0 = row_ids12_data[arc_idx012],
+      state_idx0x = row_splits1_data[fsa_idx0];
+    int32_t state_idx1 = arcs_data[arc_idx012].src_state,
+      state_idx01 = state_idx0x + state_idx1;
+    row_ids12_data[arc_idx012] = state_idx01;  // we're turning this into the row_ids2.
   };
-  Eval(c, num_arcs, lambda_set_row_ids2);
+  Eval(c, num_arcs, lambda_make_row_ids2);
 
-  Array1<int32_t> row_splits2(c, tot_num_states + 1);
-  RowIdsToRowSplits(c, num_arcs, row_ids2_data, false, tot_num_states,
-                    row_splits2.Data());
-#ifndef NDEBUG
+  Array1<int32_t> &row_ids2 = row_ids12;  // we overwrote the data in the lambda above.
+  RowIdsToRowSplits(row_ids2, row_splits2);
+
   if (!ValidateRowSplitsAndIds(
           row_splits2, row_ids2,
-          &num_states_per_fsa)) {  // last arg is temp space
-    K2_LOG(FATAL) << "Failure validating row-splits/row-ids, likely code error";
+          &row_splits12)) {  // last arg is temp space
+    K2_LOG(WARNING) << "Could not convert tensor to FSA, problem validating "
+      "row-splits and row-ids (likely data corruption or code bug)";
   }
-#endif
-  RaggedShape fsas_shape =
-      RaggedShape3(&fsa_state_offsets, &fsa_ids, fsa_ids.Dim(), &row_splits2,
-                   &row_ids2, row_ids2.Dim());
-  Array1<Arc> arcs_array(num_arcs, t.GetRegion(), 0);
-  FsaVec ans = Ragged<Arc>(fsas_shape, arcs_array);
-  int32_t properties = GetFsaVecBasicProperties(ans);
-  // TODO: check properties, at least
-  int32_t required_props = (kFsaPropertiesValid | kFsaPropertiesNonempty |
-                            kFsaPropertiesSerializable);
-  if (properties & required_props) {
-    K2_LOG(WARNING) << "Did not have expected properties "
-                    << (properties & required_props) << " vs. "
-                    << required_props;
-    // TODO: better way of displaying properties.
-    *error = true;
-  }
-  return ans;
+
+  return FsaVec(RaggedShape3(&row_splits1, &row_ids1, num_states,
+                             &row_splits2, &row_ids2, num_arcs),
+                arcs);
 }
+
+Tensor FsaVecToTensor(const Fsa &fsa_vec) {
+  if (fsa_vec.NumAxes() != 3) {
+    K2_LOG(FATAL) << "Expected num-axes == 3";
+  }
+  Array1<int32_t> row_splits1 = fsa_vec.shape.RowSplits(1),
+    row_splits12 = fsa_vec.shape.RowSplits(2)[row_splits1];
+  int32_t num_fsas = fsa_vec.shape.Dim0();
+  ContextPtr c = row_splits1.Context();
+  // vector containing: [ num_fsas, 0 ]
+  Array1<int32_t> meta_info = Range(c, 2, num_fsas, -num_fsas);
+  const Array1<Arc> &arcs = fsa_vec.values;
+  Array1<int32_t> arcs_linearized(arcs.Dim() * 4, arcs.GetRegion(),
+                                  arcs.ByteOffset());
+  int32_t byte_offset = arcs.ByteOffset();
+  // The next if-statement detects when this FSA was previously serialized.
+  if (byte_offset == (2 + (num_fsas + 1) * 2) * 4 &&
+      row_splits1.ByteOffset() == 2 * 4) {
+    Array1<int32_t> meta_info_orig(2, arcs.GetRegion(), 0),
+      row_splits12_orig(num_fsas + 1, arcs.GetRegion(), (2 + (num_fsas + 1)) * 4);
+    if (Equal(meta_info_orig, meta_info) &&
+        Equal(row_splits12, row_splits12_orig)) {
+      return Array1<int32_t>(2 + (num_fsas + 1) * 2 + arcs.Dim() * 4,
+                             arcs.GetRegion(), 0).ToTensor();
+    }
+  }
+  
+  Array1<int32_t> *arrays[4] = { &meta_info, &row_splits1, &row_splits12,
+                                 &arcs_linearized };
+  return Append(4, (const Array1<int32_t>**)arrays).ToTensor();
+}
+  
 
 }  // namespace k2

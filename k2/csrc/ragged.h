@@ -3,7 +3,8 @@
  * ragged
  *
  * @copyright
- * Copyright (c)  2020  Xiaomi Corporation (authors: Daniel Povey)
+ * Copyright (c)  2020  Xiaomi Corporation (authors: Daniel Povey
+ *                                                   Haowen Qiu)
  *
  * @copyright
  * See LICENSE for clarification regarding multiple authors
@@ -31,6 +32,7 @@ struct RaggedShapeDim {
   Array1<int32_t> row_splits;
   // Search for "row_ids concept" in utils.h for explanation
   Array1<int32_t> row_ids;
+
   // cached_tot_size can be viewed as the number of elements in a ragged
   // matrix,
   // or -1 if not known.  (Note: it can legitimately be 0, if there are no
@@ -52,29 +54,24 @@ class RaggedShape {
     return axes_[0].row_splits.Dim() - 1;
   }
   /* Return the  total size on this axis.  Requires 0 <= axis < NumAxes() and
-     for axis=0 the returned value is the same as Dim0().  */
-  int32_t TotSize(int32_t axis) {
-    K2_CHECK_GE(axis, 0);
-    K2_CHECK_LT(axis, NumAxes());
-    if (axis == 0)
-      return Dim0();
-    else {
-      RaggedShapeDim &rsd = axes_[axis - 1];
-      if (rsd.cached_tot_size >= 0) {
-        return rsd.cached_tot_size;
-      } else {
-        // if we had row_ids set up, we should have set cached_tot_size.
-        K2_CHECK_EQ(rsd.row_ids.Dim(), 0);
-        K2_CHECK_GT(rsd.row_splits.Dim(), 0);
-        rsd.cached_tot_size = rsd.row_splits[rsd.row_splits.Dim() - 1];
-        return rsd.cached_tot_size;
-      }
-    }
-  }
+     for axis=0 the returned value is the same as Dim0().
+     Caution: we use const_cast inside this function as it may actually modify
+     the cached_tot_size members of RaggedShapeDim if not set.
+  */
+  int32_t TotSize(int32_t axis) const;
+
+  /* Append `other` to `*this` (in-place version that modifies `*this`).
+     `other` must have the same number of axes as `this`.  This is efficient in
+     an amortized way, i.e. should take time/work that's O(n) in the size of
+     `other`, not `*this`, if you make many calls to Append().  This is due to
+     the policy used in Region::Extend(), where it at least doubles the size
+     each time, similar to std::vector.
+  */
+  void Append(const RaggedShape &other);
 
   // Returns the number of elements that a ragged array with this shape would
   // have.
-  int32_t NumElements() { return TotSize(NumAxes() - 1); }
+  int32_t NumElements() const { return TotSize(NumAxes() - 1); }
 
   /*
     Return the row-splits for axis `axis` with `0 < axis < NumAxes()`.
@@ -89,17 +86,25 @@ class RaggedShape {
     return axes_[axis - 1].row_splits;
   }
 
+  const Array1<int32_t> &RowSplits(int32_t axis) const {
+    K2_CHECK_GT(axis, 0);
+    K2_CHECK_LT(axis, NumAxes());
+    // Note row_splits is always nonempty for valid RaggedShapeDim.
+    return axes_[axis - 1].row_splits;
+  }
+
   /*
     Return the row-ids for axis `axis` with `0 < axis < NumAxes()`.
-    The dimension is the number of elements on this axis == TotSize(axis).
+   The dimension is the number of elements on this axis == TotSize(axis).
   */
   Array1<int32_t> &RowIds(int32_t axis);
+  const Array1<int32_t> &RowIds(int32_t axis) const;
 
   int32_t NumAxes() const { return static_cast<int32_t>(axes_.size()) + 1; }
 
   // Gives max size of any list on the provided axis,
   // with 0 < axis < NumAxes().  Equals max difference between successive
-  // row_splits on that  axis.
+  // row_splits on that axis.
   int32_t MaxSize(int32_t axis);
 
   ContextPtr &Context() const { return axes_[0].row_splits.Context(); }
@@ -148,7 +153,11 @@ class RaggedShape {
   const std::vector<RaggedShapeDim> &Axes() const { return axes_; }
 
   // Check the RaggedShape for consistency; die on failure.
-  void Check();
+  void Check() { K2_CHECK(Validate(true)); }
+
+  // Validate the RaggedShape; on failure will return false (may also
+  // print warnings).
+  bool Validate(bool print_warnings = true);
 
   // Convert to possibly different context.
   RaggedShape To(ContextPtr ctx) const;
@@ -228,143 +237,14 @@ class RaggedShapeIndexIterator {
   const int32_t num_elements_;
 };
 
-/*
-  Stack a list of RaggedShape to create a RaggedShape with one more axis.
-  Similar to TF/PyTorch's Stack.  The result will have Dim0 == src_size.   All
-  the source RaggedShapes must have the same NumAxes().
-
-     @param [in] src_size  The number of `RaggedShape`s in `src`
-     @param [in] src    The shapes to be stacked
-     @param [in] axis   The new axis whose dimension will equal src_size.
-                        CAUTION: only axis == 0 and axis == 1 are supported
-                        right now, and for the axis==1 case we have a
-                        requirement that all the src[i]->Dim0() have the
-                        same value.
-
-     @return  The appended result.
-
-        Viewing the source and result as the shapes of n-dimensional arrays,
-        if axis==0 we will have:
-            result[i,j,k,l] = (*src[i])[j,k,l]
-        and if axis==1 we will have:
-            result[i,j,k,l] = (*src[j])[i,k,l]
-        (although of course no such operator actually exists at the C++ level,
-        and these are just the shapes of arrays..).
-        See also the version of Stack for class Ragged.
- */
-RaggedShape Stack(int32_t axis, int32_t src_size, const RaggedShape **src);
-
-/*
-  Insert a new axis at position `axis`, with 0 <= axis <= src.NumAxes(), for
-  which the only allowed index will be 0 (which is another way of saying: all
-  list sizes on that axis will be 1).
-
-     @param [in] src   Source shape.  Row-ids and Row-splits of answer will
-                      share memory with those in `src` (although it goes
-                      without saying).
-     @param [in] axis  Axis to insert.
-
-  Note: you probably shouldn't be using this very often; if you are using
-  this, you may be thinking in a PyTorch-y way but you should be relying on
-  things like Eval() with custom lambdas more.  Read algorithms like in
-  compose.cc to understand why.  Also: axis==0 is probably the only really
-  useful case. See more useful notes in comments in the implementation.
- */
-RaggedShape Unsqueeze(RaggedShape &src, int32_t axis);
-
-/* Remove an axis; if it it not the last axis, this is done by appending lists
-   (effectively the axis is combined with the following axis).  If it is the
-   last axis it is just removed and the number of elements will be affected.
-
-          @param [in] src Ragged shape to remove axis of (`src` is conceptually
-                      unchanged by this operation but non-const because
-                      row-splits or row-ids may need to be generated).
-                      We require src.NumAxes() > 2, since the minimum number of
-                      axes for a RaggedShape is 2.
-          @param [in] axis  Axis to remove; must satisfy
-                            0 <= axis < src.NumAxes()
-          @return      Returns the modified shape with one fewer axis; will
-                       satisfy ans.TotSize(axis) == src.TotSize(axis + 1).
-                       if axis < src.NumAxes() - 1.
-*/
-RaggedShape RemoveAxis(RaggedShape &src, int32_t axis);
-
-/*
-  Transpose a RaggedShape: namely, axes 0 and 1.  Requires that the sizes
-  of lists on axis 1 all be the same, i.e. that src.RowSplits(1) have
-  equally spaced elements.
-
-     @param [in] src   Shape to be transposed.  We require src.NumAxes() > 2.
-                       (this is because the implementation would be slightly
-                       different, and because if you had a ragged array
-                       with 2 axes and a regular shape, you should really
-                       be using an Array2 or Tensor).
-     @return           Returns the transposed shape, with axes 0 and 1
-                       swapped.  Will satisfy
-                       ans.Dim0() == src.TotSize(1) / src.Dim0()
- */
-RaggedShape Transpose(RaggedShape &src);
-
-/*
-   Append a list of RaggedShape to form a single RaggedShape
-
-      @param [in] num_srcs Number of source shapes to append
-      @param [in] src      Array of sources to append
-      @param [in] axis     Axis to append them on.   Previous axes must
-                           have the same shape!   CAUTION: currently
-                           we only support axis == 0.
-      @return      Returns the appended RaggedShape.
-*/
-RaggedShape Append(int32_t num_srcs, RaggedShape **src, int32_t axis);
-
-/*
-    Gets an array of pointers to the row_splits of `src`, on the same
-    device as `src`.
-       @param [in] src  Source RaggedShape
-       @return        Returns an array of size src.NumAxes() - 1 containing
-                      pointers to the starts of the row_splits vetors
-*/
-Array1<int32_t *> GetRowSplitsPtr(RaggedShape &src);
-
-/*
-  Renumber(/Reorder) axis 0 of a ragged shape
-     @param [in] src      Shape to renumber
-     @param [in] new2old  Mapping from new to old numbering of array, of
-                          length src.Dim0(), on the same device as `src`;
-                          must contain the numbers
-                          0 through src.Dim0() - 1 in some order.
-     @return              Returns the renumbered shape.  Will satisfy:
-                          ret[i,j,k] = src[new2old[i],j,k].  (Note, this is
-                          not actual C++ code, it represents a conceptual
-                          indexing operator).
-*/
-RaggedShape Renumber(RaggedShape &src, const Array1<int32_t> &new2old);
-
-/*
-  Return a random RaggedShape, with a CPU context.  Intended for testing.
-
-     @param [in] set_row_ids    If false, row_ids in the returned RaggedShape
-                                will be empty; If true, row_ids would be filled.
-     @param [in] min_num_axes   Minimum number of axes (must be at least 2)
-     @param [in] max_num_axes   Maximum number of axes, must be
-                                >= min_num_axes
-     @param [in] min_num_elements  Minimum number of elements; must be at
-                                   least 0.
-     @param [in] max_num_elements  Maximum number of elements; must be
-                                    >= min_num_elements.
- */
-RaggedShape RandomRaggedShape(bool set_row_ids = false,
-                              int32_t min_num_axes = 2,
-                              int32_t max_num_axes = 4,
-                              int32_t min_num_elements = 0,
-                              int32_t max_num_elements = 2000);
-
 template <typename T>
 struct Ragged {
   RaggedShape shape;  // TODO: consider making the shape a pointer??
+
   Array1<T> values;
 
-  Ragged(RaggedShape &shape, Array1<T> &values) : shape(shape), values(values) {
+  Ragged(const RaggedShape &shape, const Array1<T> &values)
+      : shape(shape), values(values) {
     K2_CHECK(IsCompatible(shape, values));
     K2_CHECK_EQ(shape.NumElements(), values.Dim());
   }
@@ -384,8 +264,19 @@ struct Ragged {
     return values[shape[indexes]];
   }
 
-  ContextPtr Context() { return values.Context(); }
-  int32_t NumAxes() { return shape.NumAxes(); }
+  ContextPtr &Context() const { return values.Context(); }
+  int32_t NumAxes() const { return shape.NumAxes(); }
+  const Array1<int32_t> &RowSplits(int32_t axis) const {
+    return shape.RowSplits(axis);
+  }
+  Array1<int32_t> &RowSplits(int32_t axis) { return shape.RowSplits(axis); }
+  const Array1<int32_t> &RowIds(int32_t axis) const {
+    return shape.RowIds(axis);
+  }
+  Array1<int32_t> &RowIds(int32_t axis) { return shape.RowIds(axis); }
+  int32_t TotSize(int32_t axis) const { return shape.TotSize(axis); }
+  int32_t Dim0() const { return shape.Dim0(); }
+  bool Validate(bool print_warnings = true);
 
   /*
     It is an error to call this if this.shape.NumAxes() < 2.  This will return
@@ -432,13 +323,12 @@ struct Ragged {
     return Ragged<T>(sub_shape, sub_values);
   }
 
-  // TODO(haowen): used in k2/csrc/compose.cu, need to be implemented
-  Ragged<T> RemoveAxis(int32_t axis) const {
-    K2_LOG(FATAL) << "Not implemented";
-    return Ragged<T>();
-  }
+  // Note *this is conceptually unchanged by this operation but non-const
+  // because this->shape's row-ids may need to be generated.
+  // This function is defined in ragged_ops_inl.h.
+  Ragged<T> RemoveAxis(int32_t axis);
 
-  Ragged<T> To(ContextPtr ctx) {
+  Ragged<T> To(ContextPtr ctx) const {
     RaggedShape new_shape = shape.To(ctx);
     Array1<T> new_values = values.To(ctx);
     return Ragged<T>(new_shape, new_values);
@@ -448,147 +338,6 @@ struct Ragged {
 template <typename T>
 std::ostream &operator<<(std::ostream &stream, const Ragged<T> &r);
 
-/*
-  Return ragged shape with only a subset of the bottom-level elements
-  kept.  Require renumbering.NumOldElems() == src.TotSize(src.NumAxes()-1).
-  Note: all dimensions and tot-sizes preceding that will remain the
-  same, which might give rise to empty lists.
- */
-RaggedShape SubsampleRaggedShape(RaggedShape &src, Renumbering &renumbering);
-
-/*
-  Stack a list of Ragged arrays to create a Ragged array with one more axis.
-  Similar to TF/PyTorch's Stack.  The result will have Dim0 == num_srcs.  All
-  the source Ragged arrays' shapes must have the same NumAxes().
-
-     @param [in] axis   The new axis whose dimension will equal num_srcs.
-              CAUTION: only axis == 0 and axis == 1 are supported right now,
-              and for the axis==1 case we have a requirement that all the
-              src->Dim0() return the same value.
-
-     @param [in] num_srcs  The number of `RaggedShape`s in `src`
-     @param [in] src    The shapes to be stacked
-     @return  The appended result.
-
-       Assuming as an example that the input had 3 axes:
-       if axis==0, the result would have:
-          result[i,j,k,l] = (*src[i])[j,k,l]
-        and if axis==1 we would have:
-          result[i,j,k,l] = (*src[j])[i,k,l]
- */
-template <typename T>
-Ragged<T> Stack(int32_t axis, int32_t num_srcs, Ragged<T> **src);
-
-/*
-  This version of Stack() has one fewer levels of pointer indirection,
-  it is just a wrapper for the version above.
- */
-template <typename T>
-Ragged<T> Stack(int32_t axis, int32_t num_srcs, Ragged<T> *src);
-
-/*
-  Construct a RaggedShape with 2 axes.
-     @param [in] row_splits   row_splits, or NULL (at least one of this and
-  row_ids must be non-NULL).  Note: the dimension of row_splits must equal the
-  number of rows plus one; row_splits[0] must be zero and the array must be
-  non-decreasing; and the last element of row_splits is the total number of
-  elements in the ragged matrix.
-     @param [in] row_ids      row_splits, or NULL (at least one of this and
-  row_ids must be non-NULL).  Note: the dimension of row_splits must equal the
-  number of elements plus one; the array must be non-decreasing; and the last
-  element of row_splits equals the number of rows.  If both row_ids and
-  row_splits are supplied, we require row_splits[row_ids[i]] <= i <
-  row_splits[row_ids[i]+1].
-     @param [in] cached_tot_size   Total number of elements in the ragged
-                              matrix, or -1 if the user does not wish to supply
-  it now. (If >= 0, must equal `(*row_splits)[row_splits.Size()-1]` if
-  row_splits is non-NULL, or row_ids->Dim()-1 if row_ids is non-NULL.
-*/
-RaggedShape RaggedShape2(Array1<int32_t> *row_splits, Array1<int32_t> *row_ids,
-                         int32_t cached_tot_size);
-
-/*
-  This is a general method of creating higher-dimensional ragged shapes.
-     @param [in] a   RaggedShape describing the top level (first indexes)
-                     of the returned shape
-     @param [in] b   RaggedShape describing the bottom level (later
-                     indexes) of the returned shape.  We require
-                     a.NumElements() == b.Dim0().
-     @return     Returns the combined ragged shape.  Its number of axes
-                 will be equal to a.NumAxes() + b.NumAxes() - 1 (the last
-                 axis of a and the first axis of b are combined).
- */
-RaggedShape ComposeRaggedShapes(RaggedShape &a, RaggedShape &b);
-
-/*
-  Construct a RaggedShape with 3 axes.  For N=1 and 2 respectively:
-  either row_splitsN or row_idsN or both must be non-NULL.
-  If cached_tot_sizeN is not -1, it must equal the total size on
-  that axis which will equal the last element of row_splitsN (if
-  provided) and must equal the row_idsN.Dim(), if provided.
-*/
-RaggedShape RaggedShape3(Array1<int32_t> *row_splits1,
-                         Array1<int32_t> *row_ids1, int32_t cached_tot_size1,
-                         Array1<int32_t> *row_splits2,
-                         Array1<int32_t> *row_ids2, int32_t cached_tot_size2);
-
-/*
-  Allocates an *invalid* RaggedShape given the TotSize() values for each axis.
-  This allocates space for all the row_ids and row_splits, but does not write
-  any data to them.  View this as an internal function, because such a
-  RaggedShape would not be usable directly.
-
-     @input num_axes   Number of axes of ragged shape desired; must be at
-                       least 2.
-     @input tot_sizes  Total size on each axis
-     @return           The returned RaggedShape satisfies
-                       ans.TotSize(axis) == tot_sizes[axis], and has all
-                       its row_splits and row_ids allocated but not
-                       filled in, and its cached_tot_size elements
-                       set.
- */
-RaggedShape RaggedShapeFromTotSizes(int32_t num_axes, int32_t *tot_sizes);
-
-/*
-  Creates a random ragged array (with a CPU context!).  Note: you may want to
-  explicitly
-  use the template arg, e.g. invoke as RandomRagged<int32_t>(...) .
-
-     @param [in] min_value  Minimum element value allowed
-     @param [in] max_value  Maximum element value allowed
-     @param [in] min_num_axes   Minimum number of axes (must be at least 2)
-     @param [in] max_num_axes   Maximum number of axes, must
-                                be >= min_num_axes
-     @param [in] min_num_elements  Minimum number of elements;
-                                   must be at least 0.
-     @param [in] max_num_elements  Maximum number of elements;
-                                   must be >= min_num_elements.
-
-     @return  Returns a random ragged array, with a CPU context.
- */
-template <typename T>
-Ragged<T> RandomRagged(T min_value = static_cast<T>(0),
-                       T max_value = static_cast<T>(100),
-                       int32_t min_num_axes = 2, int32_t max_num_axes = 4,
-                       int32_t min_num_elements = 0,
-                       int32_t max_num_elements = 2000);
-
-/*
-  Sort a ragged array in-place.
-
-     @param [inout]   The input array to be sorted.
-                      CAUTION: it is sorted in-place.
-     @param [out]     The indexes mapping from the sorted
-                      array to the input array. The caller
-                      has to pre-allocate memory for it
-                      on the same device as `src`.
- */
-template <typename T, typename Op = LessThan<T>>
-void SortSublists(Ragged<T> *src, Array1<int32_t> *order);
-
 }  // namespace k2
-
-// TODO(dan): include guard maybe.
-#include "k2/csrc/ragged_inl.h"
 
 #endif  // K2_CSRC_RAGGED_H_

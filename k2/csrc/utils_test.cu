@@ -3,7 +3,7 @@
  * utils_test
  *
  * @copyright
- * Copyright (c)  2020  Fangjun Kuang (csukuangfj@gmail.com)
+ * Copyright (c)  2020  Mobvoi Inc.        (authors: Fangjun Kuang)
  *                      Xiaomi Corporation (authors: Haowen Qiu)
  *
  * @copyright
@@ -21,6 +21,7 @@
 #include "k2/csrc/array.h"
 #include "k2/csrc/math.h"
 #include "k2/csrc/ragged.h"
+#include "k2/csrc/ragged_ops.h"
 #include "k2/csrc/utils.h"
 
 namespace k2 {

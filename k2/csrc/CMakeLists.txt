@@ -10,13 +10,16 @@ add_subdirectory(host)
 set(context_srcs
   array_ops.cu
   compose.cu
+  top_sort.cu
   context.cu
   dtype.cu
   fsa.cu
   fsa_algo.cu
+  fsa_utils.cu
   math.cu
   moderngpu_allocator.cu
   ragged.cu
+  ragged_ops.cu
   tensor.cu
   tensor_ops.cu
   utils.cu
@@ -46,6 +49,9 @@ endif()
 set(cuda_tests
   array_ops_test
   array_test
+  fsa_algo_test
+  fsa_test
+  fsa_utils_test
   log_test
   ragged_shape_test
   ragged_test
@@ -73,6 +79,6 @@ function(k2_add_cuda_test name)
   )
 endfunction()
 
-foreach (name IN LISTS cuda_tests)
+foreach(name IN LISTS cuda_tests)
   k2_add_cuda_test(${name})
-endforeach ()
+endforeach()

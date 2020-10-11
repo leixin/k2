@@ -3,9 +3,8 @@
  * array
  *
  * @copyright
- * Copyright (c)  2020  Xiaomi Corporation (authors: Daniel Povey
- *                                                   Haowen Qiu)
- *                      Fangjun Kuang (csukuangfj@gmail.com)
+ * Copyright (c)  2020  Xiaomi Corporation (authors: Daniel Povey, Haowen Qiu)
+ *                      Mobvoi Inc.        (authors: Fangjun Kuang)
  *
  * @copyright
  * See LICENSE for clarification regarding multiple authors
@@ -51,11 +50,14 @@ class Array1 {
                                        byte_offset_);
   }
 
+  // Return a copy of this array that does not share the same underlying data.
+  Array1<T> Clone();
+
   int32_t ByteOffset() const { return byte_offset_; }
 
   // Called when creating Array2 using Array1, users should not call this for
   // now.
-  RegionPtr &GetRegion() { return region_; }
+  const RegionPtr &GetRegion() const { return region_; }
 
   // generally Callable will be some kind of lambda or function object; it
   // should be possible to evaluate it on the CUDA device (if we're compiling
@@ -74,6 +76,10 @@ class Array1 {
   // Creates an array that is not valid, e.g. you cannot call Context() on it.
   Array1() : dim_(0), byte_offset_(0), region_(nullptr) {}
 
+  // Return if the array is valid or not. An array is valid if we can call
+  // Context() on it.
+  bool IsValid() const { return region_ != nullptr; }
+
   Array1(int32_t dim, RegionPtr region, int32_t byte_offset)
       : dim_(dim), byte_offset_(byte_offset), region_(region) {}
 
@@ -85,13 +91,14 @@ class Array1 {
   /* Return sub-part of this array. Note that the returned Array1 is not const,
      the caller should be careful when changing array's data, it will
      also change data in the parent array as they share the memory.
-     @param [in] start  First element to cover, 0 <= start < Dim()
-     @param [in] size   Number of elements to include, 0 < size <= Dim()-start
+     @param [in] start  First element to cover, 0 <= start <= Dim();
+                        If start == Dim(), it just returns an empty array.
+     @param [in] size   Number of elements to include, 0 <= size <= Dim()-start
   */
   Array1 Range(int32_t start, int32_t size) {
     K2_CHECK_GE(start, 0);
-    K2_CHECK_LT(start, Dim());
-    K2_CHECK_GT(size, 0);
+    K2_CHECK_LE(start, Dim());
+    K2_CHECK_GE(size, 0);
     K2_CHECK_LE(size, Dim() - start);
     return Array1(size, region_, byte_offset_ + start * ElementSize());
   }
@@ -113,7 +120,7 @@ class Array1 {
   Tensor Range(int32_t start, int32_t size, int32_t inc) {
     K2_CHECK_GE(start, 0);
     K2_CHECK_LT(start, Dim());
-    K2_CHECK_GT(size, 0);
+    K2_CHECK_GE(size, 0);
     K2_CHECK_GT(inc, 0);
     K2_CHECK_LT((size - 1) * inc, Dim() - start);
     Dtype type = DtypeOf<ValueType>::dtype;
@@ -152,40 +159,38 @@ class Array1 {
     if (ctx->IsCompatible(*Context())) return *this;
 
     Array1 ans(ctx, Dim());
-    if (dim_ == 0) return ans;
-
-    auto kind = GetMemoryCopyKind(*Context(), *ctx);
-    T *dst = ans.Data();
-    const T *src = Data();
-    MemoryCopy(static_cast<void *>(dst), static_cast<const void *>(src),
-               Dim() * ElementSize(), kind);
+    ans.CopyFrom(*this);
     return ans;
   }
 
-  // Resizes, copying old contents if we could not re-use the same memory
-  // location. It will always at least double the allocated size if it has to
-  // reallocate. See Region::num_bytes vs. Region::bytes_used.
-  // TODO(haowen): now we only support the case that the current array `curr`
-  // (i.e. the array that will be resized) covers the highest used index in
-  // the region, that is, for any array `a` uses this region,
-  // curr.byte_offset_ + curr.Dim() * curr.ElementSize() == region_->bytes_used
-  // >= a.byte_offset + a.Dim() * a.ElementSize()
+  // Copy from another array of the same dimension and type.
+  void CopyFrom(const Array1<T> &src);
+
+  /*
+    Modify size of array, copying old contents if we could not re-use the same
+    memory location. It will always at least double the allocated size if it has
+    to reallocate. See Region::num_bytes vs. Region::bytes_used.  We only
+    support the case that the current array *this (i.e. the array that will be
+    resized) covers the highest used index in the region; this is to avoid
+    overwriting memory shared by other arrays in the same region.
+
+    Note: this may change which memory other arrays point to, if they share
+    the same Region, but it will be transparent because arrays point to the
+    Region and not to the data directly.
+  */
   void Resize(int32_t new_size) {
-    K2_CHECK_EQ(byte_offset_ + Dim() * ElementSize(), region_->bytes_used);
-
-    if (new_size <= Dim()) return;
-
-    if (byte_offset_ + new_size * ElementSize() > region_->num_bytes) {
-      // always double the allocated size
-      auto tmp = NewRegion(Context(), 2 * region_->num_bytes);
-      // copy data
-      auto kind = GetMemoryCopyKind(*Context(), *Context());
-      MemoryCopy(tmp->data, region_->data, region_->bytes_used, kind);
-      // update meta info
-      dim_ = new_size;
-      tmp->bytes_used = byte_offset_ + new_size * ElementSize();
-      std::swap(tmp, region_);
+    if (new_size < dim_) {
+      K2_CHECK_GE(new_size, 0);
+    } else {
+      std::size_t cur_bytes_used = byte_offset_ + sizeof(T) * dim_,
+                  new_bytes_used = byte_offset_ + sizeof(T) * new_size;
+      // the following avoids a situation where we overwrite data shared with
+      // other Array objects.  You can just do *this = Array1<T>(...) and
+      // overwrite *this with a new region if that's what you want.
+      K2_CHECK_EQ(cur_bytes_used, region_->bytes_used);
+      region_->Extend(new_bytes_used);
     }
+    dim_ = new_size;
   }
 
   ContextPtr &Context() const { return region_->context; }
@@ -219,10 +224,20 @@ class Array1 {
     } else {
       K2_CHECK_EQ(type, kCuda);
       T ans;
-      MemoryCopy(static_cast<void *>(&ans), static_cast<const void *>(data),
-                 ElementSize(), MemcpyDeviceToHost);
+      cudaError_t ret = cudaMemcpy(static_cast<void *>(&ans),
+                                   static_cast<const void *>(data),
+                                   ElementSize(),
+                                   cudaMemcpyDeviceToHost);
+      K2_CHECK_CUDA_ERROR(ret);
       return ans;
     }
+  }
+
+  // return the last element on CPU of *this if dim >= 1,
+  // will crash if *this is empty.
+  T Back() const {
+    K2_CHECK_GE(dim_, 1);
+    return operator[](dim_ - 1);
   }
 
   /* Setting all elements to a scalar */
@@ -260,7 +275,7 @@ class Array1 {
     T *data = Data();
     auto kind = GetMemoryCopyKind(*GetCpuContext(), *Context());
     MemoryCopy(static_cast<void *>(data), static_cast<const void *>(src.data()),
-               src.size() * ElementSize(), kind);
+               src.size() * ElementSize(), kind, Context().get());
   }
 
   Array1(const Array1 &other) = default;
@@ -299,6 +314,7 @@ class Array1 {
     dim_ = size;
     byte_offset_ = 0;
   }
+
 };
 
 // Could possibly introduce a debug mode to this that would do bounds checking.
@@ -351,7 +367,7 @@ class Array2 {
   // Currently ByteOffset and GetRegion is for internal usage, user should never
   // call it for now.
   int32_t ByteOffset() const { return byte_offset_; }
-  RegionPtr &GetRegion() { return region_; }
+  const RegionPtr &GetRegion() const { return region_; }
 
   ContextPtr &Context() const { return region_->context; }
 
@@ -459,7 +475,7 @@ class Array2 {
       T *dst = ans.Data();
       const T *src = Data();
       MemoryCopy(static_cast<void *>(dst), static_cast<const void *>(src),
-                 dim0_ * dim1_ * ElementSize(), kind);
+                 dim0_ * dim1_ * ElementSize(), kind, ctx.get());
       return ans;
     } else {
       return ToContiguous(*this).To(ctx);
@@ -599,5 +615,9 @@ std::ostream &operator<<(std::ostream &stream, const Array2<T> &array) {
 }
 
 }  // namespace k2
+
+#define IS_IN_K2_CSRC_ARRAY_H_
+#include "k2/csrc/array_inl.h"
+#undef IS_IN_K2_CSRC_ARRAY_H_
 
 #endif  // K2_CSRC_ARRAY_H_

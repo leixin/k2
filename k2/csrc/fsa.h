@@ -4,6 +4,7 @@
  *
  * @copyright
  * Copyright (c)  2020  Xiaomi Corporation (authors: Daniel Povey)
+ *                      Guoguo Chen
  *
  * @copyright
  * See LICENSE for clarification regarding multiple authors
@@ -12,7 +13,11 @@
 #ifndef K2_CSRC_FSA_H_
 #define K2_CSRC_FSA_H_
 
+#include <ostream>
+#include <string>
+
 #include "k2/csrc/ragged.h"
+#include "k2/csrc/ragged_ops.h"
 
 namespace k2 {
 
@@ -20,8 +25,26 @@ struct Arc {
   int32_t src_state;
   int32_t dest_state;
   int32_t symbol;
-  float score;  // we have the space to put this here, so...
+  float score;
+
+  Arc() = default;
+  Arc(int32_t src_state, int32_t dest_state, int32_t symbol, float score)
+      : src_state(src_state),
+        dest_state(dest_state),
+        symbol(symbol),
+        score(score) {}
+
+  bool operator<(const Arc &other) const {
+    // Compares `src_state` first, then `symbol`, then `dest_state`, then
+    // 'score'
+    return std::tie(src_state, symbol, dest_state, score) <
+           std::tie(other.src_state, other.symbol, other.dest_state,
+                    other.score);
+  }
 };
+
+// for debug only
+std::ostream &operator<<(std::ostream &os, const Arc &arc);
 
 using FsaProperties = uint32_t;
 
@@ -31,11 +54,7 @@ using FsaProperties = uint32_t;
   using an arc and adjacent arcs (and the structural info).
  */
 enum FsaBasicProperties {
-  kFsaPropertiesValid = 0x01,      // Valid from a formatting perspective *as an
-                                   // FsaVec*.  Also require
-                                   // kFsaPropertiesSingleFsa == true if
-                                   // this is supposed to be a single FSA, not
-                                   // an FsaVec.
+  kFsaPropertiesValid = 0x01,      // Valid from a formatting perspective
   kFsaPropertiesNonempty = 0x02,   // Nonempty as in, has at least one arc.
   kFsaPropertiesTopSorted = 0x04,  // FSA is top-sorted, dest_state >= src_state
   kFsaPropertiesTopSortedAndAcyclic =
@@ -63,9 +82,21 @@ enum FsaBasicProperties {
                                         // leaving it.  These properties are
                                         // used in figuring out the boundaries
                                         // between FSAs when we serialize to a
-                                        // list of arcs.
+                                        // list of arcs.  You should probably
+                                        // ignore this value in individual FSAs,
+                                        // it is intended for vectors of FSAs.
   kFsaAllProperties = 0x03FF
 };
+
+/* Convert FSA properties to a string.
+
+   @param [in] properties
+   @return A string consisting of the names of FsaBasicProperties'
+           member separated by |. For example, if properties == 3,
+           it will return kFsaPropertiesValid|kFsaPropertiesNonempty.
+           If properties == 0, it returns an empty string.
+ */
+std::string FsaPropertiesAsString(int32_t properties);
 
 using Fsa = Ragged<Arc>;  // 2 axes: state,arc
 
@@ -118,7 +149,7 @@ struct DenseFsaVec {
   Array2<float> scores;
 
   // NOTE: our notion of "arc-index" / arc_idx is an index into scores.Data().
-  int32_t NumArcs() { return scores.Dim0() * scores.Dim1(); }
+  int32_t NumArcs() const { return scores.Dim0() * scores.Dim1(); }
 };
 
 /*
@@ -153,45 +184,73 @@ struct DenseFsaVec {
 */
 Fsa FsaFromTensor(Tensor &t, bool *error);
 
+Fsa FsaFromArray1(Array1<Arc> &arc, bool *error);
+
 /*
   Returns a single Tensor that represents the FSA; this is just the vector of
   Arc reinterpreted as  num_arcs by 4 Tensor of int32_t.  It can be converted
-  back to an equivalent FSA using `FsaFromTensor`.
+  back to an equivalent FSA using `FsaFromTensor`.  Notice: this is not the
+  same format as we use to serialize FsaVec.
+
+  It is an error if `fsa.NumAxes() != 2`.
  */
 Tensor FsaToTensor(const Fsa &fsa);
 
 /*
-  Returns a single Tensor that represents the vector of FSAs; this is just the
-  vector of Arc reinterpreted as num_arcs by 4 Tensor of int32_t.  It can be
-  converted back to an equivalent FsaVec using `FsaVecFromTensor`.
- */
-Tensor FsaVecToTensor(const Fsa &fsa);
+  Returns a single Tensor that represents a vector of FSAs.  It is a vector of
+  int32_t's (on the same device as `fsa_vec`).  The format is as follows:
+
+       - 1st element is num_fsas
+       - 2nd element is currently zero (included for word-alignment purposes)
+       - Next `num_fsas + 1` elements are the row_splits1 of the FsaVec,
+         i.e. 0, num_states1, num_states1+num_states2, ...  [the exlusive-sum
+         of the num-states of all the FSAs]
+       - Next `num_fsas + 1` elements are combined row_splits1 and row_splits2 of
+         the FsaVec, which are the exclusive sum of the total number of arcs
+         in the respective FSAs.
+       - Next `num_arcs * 4` elements are the arcs in the FSAs (note: the
+         float-valued will be reinterpreted as int32_t's but are still floats).
+
+  If it is really a transducer you can just store the olabels as a separate
+  tensor; the num-arcs and the arc layout will survive the round-trip to
+  serialization so this will work.
+
+  You can convert this back to an FSA using `FsaVecFromTensor`.
+
+  It is an error if `fsa_vec` does not have 3 axes.  Empty FsaVec's are allowed, though
+  (i.e. num_fsas == 0 is allowed).
+*/
+Tensor FsaVecToTensor(const Fsa &fsa_vec);
 
 /*
-  Create an FsaVec (vector of FSAs) from a Tensor.  Please see FsaFromTensor for
-  how this works for a single FSA.  The reason we can do the same with multiple
-  FSAs is that we can use the discontinuities in `src_state` (i.e. where the
-  values decrease) to spot where one FSA starts and the next begins.  However
-  this only works if all the FSAs were nonempty, i.e. had at least one state.
-  This function will die with an assertion failure if any of the provided
-  FSAs were empty, so the user should check that beforehand.
+  Create an FsaVec (vector of FSAs) from a Tensor which is an array of int32_t's.
+  This tensor is interpreted as follows:
+     First 2 elements:           num_fsas 0
+     Next num_fsas + 1 elements:  row_splits1 of the FsaVec, which is
+                                the cumulative sum of num_states
+     Next num_fsas + 1 elements:  row_splits12 of the FsaVec, i.e. its
+                                row_splits2[row_splits1], which is the
+                                cumulative sum of num_arcs for those FSAs
+     Next num_arcs * 4 elements:  the arcs.  The scores in the arcs are really
+                                of type float, not int32_t.
 
-  Please see FsaFromTensor() for documentation on what makes the individual
-  FSAs valid; however, please note that the FSA with no states (empty FSA)
-  cannot appear here, as there is no way to indicate it in a flat
-  series of arcs.
 
-    @param [in] t   Source tensor.  Must have dtype == kInt32Dtype and be of
-                    shape (N > 0) by 4.  Caution: the returned FSA will share
-                    memory with this tensor, so don't modify it afterward!
+    @param [in] t   Source tensor.  Must have dtype == kInt32Dtype and have one
+                    axis.  Caution: the returned FSA will share
+                    memory with this tensor if the FSA was originally created by
+                    FsaVecFromTensor().
     @param [out] error   Error flag.  On success this function will write
-                         'false' here; on error, it will print an error
-                         message to the standard error and write 'true' here.
+                      'false' here; on error, it will print an error
+                       message to the standard error and write 'true' here.
     @return         The resulting FsaVec (vector of FSAs) will be returned;
-                    this is a Ragged<Arc> with 3 axes.
+                    this is a Ragged<Arc> with 3 axes.  Caution, it will not have
+                    been fully validated; you might want to check the kFsaPropertiesValid
+                    property once you compute the properties.
 
 */
 FsaVec FsaVecFromTensor(Tensor &t, bool *error);
+
+Fsa FsaVecFromArray1(Array1<Arc> &arc, bool *error);
 
 /*
   Return one Fsa in an FsaVec.  Note, this has to make copies of the
@@ -210,28 +269,57 @@ inline Fsa GetFsaVecElement(FsaVec &vec, int32_t i) { return vec.Index(0, i); }
   Create an FsaVec from a list of Fsas.  Caution: Fsa and FsaVec are really
   the same type, just with different expectations on the number of axes!
  */
-inline FsaVec CreateFsaVec(const FsaVec &vec, int32_t num_fsas, Fsa **fsas) {
-  // Implementation goes to this templat:
+inline FsaVec CreateFsaVec(int32_t num_fsas, const Fsa **fsas) {
+  // Implementation goes to this template:
   //  template <typename T>
   //  Ragged<T> Stack(int32_t axis, int32_t src_size, const Ragged<T> *src);
-  K2_CHECK(fsas[0]->NumAxes() == 2);
+  K2_CHECK_EQ(fsas[0]->NumAxes(), 2);
   return Stack(0, num_fsas, fsas);
 }
 
-int32_t GetFsaBasicProperties(const Fsa &fsa);
-int32_t GetFsaVecBasicProperties(const FsaVec &fsa_vec);
+// Returns FSA with no arcs and no states, which is just an empty Ragged<Arc> with 2 axes.
+Fsa EmptyFsa();
 
+// Converts Fsa to FsaVec with one element (note: will share the same underlying
+// memory, just add an extra axis).
+// Is non-const becaues the FSA's row-ids
+FsaVec FsaVecFromFsa(const Fsa &fsa);
+
+// Compute and return basic properties for Fsa.
+// Returns 0 if fsa.NumAxes() != 2.
+int32_t GetFsaBasicProperties(const Fsa &fsa);
+
+/*
+  Compute basic properties for an FsaVec, with their `and` in `properties_tot`.
+
+     @param [in] fsa_vec   FSAs to compute the properties of.  It is an
+                           error if fsa_vec.NumAxes() != 3 (will crash).
+     @param [out] properties_out  The properties per FSA will be written to
+                   here, on the same device as `fsa_vec`.  This array
+                   will be assigned to (does not have to be correctly sized at
+                   entry).
+     @param [out] tot_properties_out  The `and` of all properties in
+                  `properties_out` will be written to this host
+                  (i.e. CPU-memory) pointer.
+*/
+void GetFsaVecBasicProperties(FsaVec &fsa_vec, Array1<int32_t> *properties_out,
+                              int32_t *tot_properties_out);
+
+// Return weights of `arcs` as a Tensor that shares the same memory
+// location
 Tensor WeightsOfArcsAsTensor(const Array1<Arc> &arcs);
 
-inline Array1<float> WeightsOfArcsAsArray(const Array1<Arc> &arcs) {
+// Return weights of `arcs` as an Array1<float>; this will not share the same
+// memory location because Array1 does not support a stride.  However
+// it would be possible to get it as an Array2.
+inline Array1<float> WeightsOfArcsAsArray1(const Array1<Arc> &arcs) {
   return Array1<float>(WeightsOfArcsAsTensor(arcs));
 }
-// If you need the weights of an Fsa or FsaVec f, you can just
-// use WeightsOfArcsAsArray(f.values).
 
-inline Array1<float> WeightsOfFsaAsArray(const Ragged<Arc> &fsa) {
+inline Array1<float> WeightsOfFsaAsArray1(const Ragged<Arc> &fsa) {
   return Array1<float>(WeightsOfArcsAsTensor(fsa.values));
 }
+
 }  // namespace k2
 
 #endif  // K2_CSRC_FSA_H_

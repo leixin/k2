@@ -3,7 +3,7 @@
  * pytorch_context
  *
  * @copyright
- * Copyright (c)  2020  Mobvoi AI Lab, Beijing, China (authors: Fangjun Kuang)
+ * Copyright (c)  2020  Mobvoi Inc.        (authors: Fangjun Kuang)
  *
  * @copyright
  * See LICENSE for clarification regarding multiple authors
@@ -83,7 +83,8 @@ class PytorchCudaContext : public Context {
   int32_t GetDeviceId() const override { return gpu_id_; }
 
   cudaStream_t GetCudaStream() const override {
-    return c10::cuda::getCurrentCUDAStream(gpu_id_);
+    return g_stream_override.OverrideStream(
+        c10::cuda::getCurrentCUDAStream(gpu_id_));
   }
 
   void *Allocate(std::size_t bytes, void **deleter_context) override {
